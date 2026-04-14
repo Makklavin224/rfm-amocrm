@@ -1,0 +1,16 @@
+{
+  "name": "rfm-amocrm",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "tsx run.ts",
+    "dry-run": "tsx test-dry-run.ts"
+  },
+  "dependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0"
+  }
+}
