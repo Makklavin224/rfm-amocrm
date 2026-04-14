@@ -1,14 +1,6 @@
-import type { AmoDeal } from './amocrm';
+import type { CustomerData } from './amocrm';
 
 // ─── Типы ───────────────────────────────────────────────
-
-export interface ContactRFM {
-  contactId: number;
-  lastPurchaseDate: Date;
-  daysSinceLastPurchase: number;
-  purchaseCount: number;
-  totalRevenue: number;
-}
 
 export type RfmSegment =
   | 'VIP'
@@ -21,8 +13,8 @@ export type RfmSegment =
   | 'Потерянный'
   | 'Архив';
 
-export interface ContactSegment {
-  contactId: number;
+export interface CustomerSegment {
+  customerId: number;
   segment: RfmSegment;
   daysSinceLastPurchase: number;
   purchaseCount: number;
@@ -31,53 +23,7 @@ export interface ContactSegment {
   frequencyPercentile: number;
 }
 
-// ─── 1. Агрегация сделок по контакту ────────────────────
-
-export function aggregateByContact(deals: AmoDeal[]): ContactRFM[] {
-  const map = new Map<
-    number,
-    { lastDate: number; count: number; revenue: number }
-  >();
-
-  for (const deal of deals) {
-    if (!deal.contact_id || !deal.closed_at) continue;
-
-    const existing = map.get(deal.contact_id);
-    if (existing) {
-      existing.lastDate = Math.max(existing.lastDate, deal.closed_at);
-      existing.count++;
-      existing.revenue += deal.price;
-    } else {
-      map.set(deal.contact_id, {
-        lastDate: deal.closed_at,
-        count: 1,
-        revenue: deal.price,
-      });
-    }
-  }
-
-  const now = new Date();
-  const results: ContactRFM[] = [];
-
-  for (const [contactId, data] of map) {
-    const lastPurchaseDate = new Date(data.lastDate * 1000);
-    const daysSince = Math.floor(
-      (now.getTime() - lastPurchaseDate.getTime()) / (1000 * 60 * 60 * 24)
-    );
-
-    results.push({
-      contactId,
-      lastPurchaseDate,
-      daysSinceLastPurchase: daysSince,
-      purchaseCount: data.count,
-      totalRevenue: data.revenue,
-    });
-  }
-
-  return results;
-}
-
-// ─── 2. PERCENTRANK (аналог Google Sheets ПРОЦЕНТРАНГ.ВКЛ) ─
+// ─── PERCENTRANK (аналог Google Sheets ПРОЦЕНТРАНГ.ВКЛ) ─
 
 function percentRankInc(values: number[], target: number): number {
   const sorted = [...values].sort((a, b) => a - b);
@@ -85,44 +31,42 @@ function percentRankInc(values: number[], target: number): number {
   if (n <= 1) return 1;
 
   let countBelow = 0;
-  let countEqual = 0;
   for (const v of sorted) {
     if (v < target) countBelow++;
-    else if (v === target) countEqual++;
   }
 
-  // PERCENTRANK.INC формула: (rank - 1) / (n - 1)
-  // rank = countBelow + 1 (для первого вхождения)
   return countBelow / (n - 1);
 }
 
-// ─── 3. Рассчитать сегменты (дерево решений из документа) ─
+// ─── Рассчитать сегменты из данных покупателей ──────────
 
-export function calculateSegments(contacts: ContactRFM[]): ContactSegment[] {
-  // Фильтруем активную базу (до 730 дней) для расчёта перцентилей
-  const activeBase = contacts.filter((c) => c.daysSinceLastPurchase <= 730);
+export function calculateSegments(customers: CustomerData[]): CustomerSegment[] {
+  const now = Date.now() / 1000; // unix seconds
 
-  // Массивы значений для перцентилей
-  const revenues = activeBase.map((c) => c.totalRevenue);
-  const frequencies = activeBase.map((c) => c.purchaseCount);
+  // Считаем дни с последней покупки для каждого
+  const withDays = customers.map((c) => ({
+    ...c,
+    daysSince: Math.floor((now - c.lastPurchaseAt) / 86400),
+  }));
 
-  return contacts.map((c) => {
-    // Считаем перцентили только по активной базе
-    const revPct = percentRankInc(revenues, c.totalRevenue);
-    const freqPct = percentRankInc(frequencies, c.purchaseCount);
+  // Активная база (до 730 дней) для расчёта перцентилей
+  const activeBase = withDays.filter((c) => c.daysSince <= 730);
 
-    const segment = assignSegment(
-      c.daysSinceLastPurchase,
-      revPct,
-      freqPct
-    );
+  const revenues = activeBase.map((c) => c.ltv);
+  const frequencies = activeBase.map((c) => c.purchasesCount);
+
+  return withDays.map((c) => {
+    const revPct = percentRankInc(revenues, c.ltv);
+    const freqPct = percentRankInc(frequencies, c.purchasesCount);
+
+    const segment = assignSegment(c.daysSince, revPct, freqPct);
 
     return {
-      contactId: c.contactId,
+      customerId: c.customerId,
       segment,
-      daysSinceLastPurchase: c.daysSinceLastPurchase,
-      purchaseCount: c.purchaseCount,
-      totalRevenue: c.totalRevenue,
+      daysSinceLastPurchase: c.daysSince,
+      purchaseCount: c.purchasesCount,
+      totalRevenue: c.ltv,
       revenuePercentile: Math.round(revPct * 100),
       frequencyPercentile: Math.round(freqPct * 100),
     };
@@ -151,12 +95,10 @@ function assignSegment(
   revPercentile: number,
   freqPercentile: number
 ): RfmSegment {
-  // Этап 1: Архив
   if (daysSince > 730) {
     return 'Архив';
   }
 
-  // Этап 2: Зона оттока (391-730 дней)
   if (daysSince > 390) {
     if (revPercentile >= 0.9) {
       return 'VIP/КИТ в оттоке';
@@ -164,9 +106,6 @@ function assignSegment(
     return 'Потерянный';
   }
 
-  // Этап 3: Активная база (≤ 390 дней)
-
-  // Блок «Элита» — топ-10% по выручке
   if (revPercentile >= 0.9) {
     if (freqPercentile >= 0.5) {
       return 'VIP';
@@ -174,7 +113,6 @@ function assignSegment(
     return 'Киты';
   }
 
-  // Блок «Средний класс» — топ-50% по выручке
   if (revPercentile >= 0.5) {
     if (freqPercentile >= 0.5) {
       return 'Лояльные';
@@ -182,7 +120,6 @@ function assignSegment(
     return 'Перспективные';
   }
 
-  // Хвост базы
   if (daysSince <= 60) {
     return 'Новичок';
   }
