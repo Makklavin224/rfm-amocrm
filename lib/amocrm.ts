@@ -138,14 +138,11 @@ export async function createCustomers(
       const segmentId = segment ? SEGMENT_IDS[segment] : undefined;
 
       const customer: any = {
-        name: `Покупатель (контакт #${contactId})`,
-        _embedded: {
-          contacts: [{ id: contactId }],
-        },
+        name: `${contactId}`,
       };
 
       if (segmentId) {
-        customer._embedded.segments = [{ id: segmentId }];
+        customer._embedded = { segments: [{ id: segmentId }] };
       }
 
       return customer;
@@ -160,7 +157,6 @@ export async function createCustomers(
     if (res.ok) {
       const data = await res.json();
       const customers = data?._embedded?.customers || [];
-      // Соотносим по порядку
       for (let i = 0; i < customers.length && i < chunk.length; i++) {
         created.set(chunk[i], customers[i].id);
       }
@@ -170,9 +166,53 @@ export async function createCustomers(
     }
 
     await sleep(300);
+
+    // Привязываем контакты через /link endpoint
+    for (let i = 0; i < chunk.length; i++) {
+      const customerId = created.get(chunk[i]);
+      if (!customerId) continue;
+
+      await fetch(`${BASE_URL}/api/v4/customers/${customerId}/link`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify([
+          { to_entity_id: chunk[i], to_entity_type: 'contacts' },
+        ]),
+      });
+      await sleep(150);
+    }
   }
 
   return created;
+}
+
+// ─── Покупатели: привязать контакты к уже созданным ─────
+
+export async function linkContactsToCustomers(
+  pairs: Array<{ customerId: number; contactId: number }>
+): Promise<number> {
+  let linked = 0;
+
+  for (const { customerId, contactId } of pairs) {
+    const res = await fetch(`${BASE_URL}/api/v4/customers/${customerId}/link`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify([
+        { to_entity_id: contactId, to_entity_type: 'contacts' },
+      ]),
+    });
+
+    if (res.ok) {
+      linked++;
+    } else {
+      const text = await res.text();
+      console.error(`Link error customer=${customerId} contact=${contactId}: ${res.status} ${text}`);
+    }
+
+    await sleep(150);
+  }
+
+  return linked;
 }
 
 // ─── Покупатели: обновить сегменты у существующих ────────
