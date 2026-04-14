@@ -19,25 +19,24 @@ export interface AmoDeal {
   closed_at: number | null;
   status_id: number;
   contact_id: number | null;
-  contact_name?: string;
 }
 
-export interface AmoContact {
-  id: number;
-  name: string;
-  custom_fields_values: Array<{
-    field_id: number;
-    field_name: string;
-    values: Array<{ value: string; enum_id?: number }>;
-  }> | null;
-  _embedded?: {
-    tags?: Array<{ id: number; name: string }>;
-  };
-}
+// Маппинг сегмент → ID сегмента в amoCRM (Покупатели → Динамическая сегментация)
+export const SEGMENT_IDS: Record<string, number> = {
+  'VIP': 113,
+  'VIP/КИТ в оттоке': 115,
+  'Киты': 117,
+  'Лояльные': 119,
+  'Перспективные': 121,
+  'Новичок': 123,
+  'В зоне риска': 125,
+  'Потерянный': 127,
+  'Архив': 129,
+};
 
 // ─── Получить все выигранные сделки (параллельно) ───────
 
-const CONCURRENT = 5; // amoCRM rate limit ~7 req/s
+const CONCURRENT = 5;
 
 async function fetchPage(page: number): Promise<{ leads: any[]; hasNext: boolean }> {
   const url = `${BASE_URL}/api/v4/leads?limit=250&page=${page}&with=contacts&filter[statuses][0][pipeline_id]=${PIPELINE_ID}&filter[statuses][0][status_id]=142`;
@@ -75,7 +74,6 @@ export async function fetchAllWonDeals(): Promise<AmoDeal[]> {
   let keepGoing = true;
 
   while (keepGoing) {
-    // Запускаем CONCURRENT страниц параллельно
     const pages = Array.from({ length: CONCURRENT }, (_, i) => page + i);
     const results = await Promise.all(pages.map((p) => fetchPage(p)));
 
@@ -87,138 +85,118 @@ export async function fetchAllWonDeals(): Promise<AmoDeal[]> {
     }
 
     page += CONCURRENT;
-    if (keepGoing) await sleep(200); // rate limit safety
+    if (keepGoing) await sleep(200);
   }
 
   return deals;
 }
 
-// ─── Получить имена контактов ───────────────────────────
+// ─── Покупатели: загрузить всех с привязанными контактами ─
 
-export async function fetchContactNames(
-  contactIds: number[]
-): Promise<Map<number, string>> {
-  const names = new Map<number, string>();
-  const chunks = chunkArray(contactIds, 50);
+export async function fetchAllCustomers(): Promise<Map<number, number>> {
+  // Возвращает Map<contact_id, customer_id>
+  const contactToCustomer = new Map<number, number>();
+  let page = 1;
 
-  for (const chunk of chunks) {
-    const ids = chunk.map((id) => `filter[id][]=${id}`).join('&');
-    const url = `${BASE_URL}/api/v4/contacts?${ids}&limit=250`;
+  while (true) {
+    const url = `${BASE_URL}/api/v4/customers?limit=250&page=${page}&with=contacts`;
     const res = await fetch(url, { headers });
 
-    if (res.status === 204) continue;
-    if (!res.ok) continue;
+    if (res.status === 204) break;
+    if (!res.ok) break;
 
     const data = await res.json();
-    for (const contact of data?._embedded?.contacts || []) {
-      names.set(contact.id, contact.name);
+    const customers = data?._embedded?.customers || [];
+
+    for (const cust of customers) {
+      const contacts = cust._embedded?.contacts || [];
+      for (const contact of contacts) {
+        contactToCustomer.set(contact.id, cust.id);
+      }
     }
+
+    if (!data._links?.next) break;
+    page++;
     await sleep(150);
   }
 
-  return names;
+  return contactToCustomer;
 }
 
-// ─── Найти или создать кастомное поле "RFM-сегмент" ─────
+// ─── Покупатели: создать новых для контактов без покупателя ─
 
-const RFM_SEGMENTS = [
-  'VIP',
-  'Киты',
-  'Лояльные',
-  'Перспективные',
-  'Новичок',
-  'В зоне риска',
-  'VIP/КИТ в оттоке',
-  'Потерянный',
-  'Архив',
-];
+export async function createCustomers(
+  contactIds: number[],
+  segmentMap: Map<number, string>
+): Promise<Map<number, number>> {
+  const created = new Map<number, number>(); // contact_id → new customer_id
+  const chunks = chunkArray(contactIds, 50);
 
-export async function ensureRfmField(): Promise<number> {
-  // Проверяем, существует ли уже поле
-  const listRes = await fetch(`${BASE_URL}/api/v4/contacts/custom_fields`, {
-    headers,
-  });
+  for (const chunk of chunks) {
+    const body = chunk.map((contactId) => {
+      const segment = segmentMap.get(contactId);
+      const segmentId = segment ? SEGMENT_IDS[segment] : undefined;
 
-  if (listRes.ok) {
-    const data = await listRes.json();
-    const existing = data?._embedded?.custom_fields?.find(
-      (f: any) => f.name === 'RFM-сегмент'
-    );
-    if (existing) return existing.id;
+      const customer: any = {
+        name: `Покупатель (контакт #${contactId})`,
+        _embedded: {
+          contacts: [{ id: contactId }],
+        },
+      };
+
+      if (segmentId) {
+        customer._embedded.segments = [{ id: segmentId }];
+      }
+
+      return customer;
+    });
+
+    const res = await fetch(`${BASE_URL}/api/v4/customers`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      const customers = data?._embedded?.customers || [];
+      // Соотносим по порядку
+      for (let i = 0; i < customers.length && i < chunk.length; i++) {
+        created.set(chunk[i], customers[i].id);
+      }
+    } else {
+      const text = await res.text();
+      console.error(`Create customers error: ${res.status} ${text}`);
+    }
+
+    await sleep(300);
   }
 
-  // Создаём поле типа select
-  const createRes = await fetch(`${BASE_URL}/api/v4/contacts/custom_fields`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify([
-      {
-        name: 'RFM-сегмент',
-        type: 'select',
-        enums: RFM_SEGMENTS.map((s) => ({ value: s })),
-      },
-    ]),
-  });
-
-  if (!createRes.ok) {
-    const text = await createRes.text();
-    throw new Error(`Failed to create custom field: ${createRes.status} ${text}`);
-  }
-
-  const result = await createRes.json();
-  return result._embedded.custom_fields[0].id;
+  return created;
 }
 
-// ─── Получить enum_id для значения поля ─────────────────
+// ─── Покупатели: обновить сегменты у существующих ────────
 
-export async function getFieldEnums(
-  fieldId: number
-): Promise<Map<string, number>> {
-  const res = await fetch(
-    `${BASE_URL}/api/v4/contacts/custom_fields/${fieldId}`,
-    { headers }
-  );
-
-  if (!res.ok) return new Map();
-
-  const data = await res.json();
-  const enums = new Map<string, number>();
-  for (const e of data.enums || []) {
-    enums.set(e.value, e.id);
-  }
-  return enums;
+export interface CustomerSegmentUpdate {
+  customerId: number;
+  segmentId: number;
 }
 
-// ─── Обновить контакты: записать сегмент + теги ─────────
-
-export interface ContactUpdate {
-  contactId: number;
-  segment: string;
-  fieldId: number;
-  enumId: number;
-}
-
-export async function batchUpdateContacts(
-  updates: ContactUpdate[]
+export async function updateCustomerSegments(
+  updates: CustomerSegmentUpdate[]
 ): Promise<number> {
   let updated = 0;
-  const chunks = chunkArray(updates, 50); // amoCRM batch limit
+  const chunks = chunkArray(updates, 50);
 
   for (const chunk of chunks) {
     const body = chunk.map((u) => ({
-      id: u.contactId,
-      custom_fields_values: [
-        {
-          field_id: u.fieldId,
-          values: [{ enum_id: u.enumId }],
-        },
-      ],
+      id: u.customerId,
       _embedded: {
-        tags: [{ name: `rfm:${u.segment.toLowerCase().replace(/[\s\/]/g, '-')}` }],
+        segments: [{ id: u.segmentId }],
       },
     }));
 
-    const res = await fetch(`${BASE_URL}/api/v4/contacts`, {
+    const res = await fetch(`${BASE_URL}/api/v4/customers`, {
       method: 'PATCH',
       headers,
       body: JSON.stringify(body),
@@ -228,61 +206,13 @@ export async function batchUpdateContacts(
       updated += chunk.length;
     } else {
       const text = await res.text();
-      console.error(`Batch update error: ${res.status} ${text}`);
+      console.error(`Update segments error: ${res.status} ${text}`);
     }
 
-    await sleep(300); // rate limit safety
+    await sleep(300);
   }
 
   return updated;
-}
-
-// ─── Удалить старые rfm: теги у контактов ───────────────
-
-export async function removeOldRfmTags(contactIds: number[]): Promise<void> {
-  const chunks = chunkArray(contactIds, 50);
-
-  for (const chunk of chunks) {
-    // Получаем контакты с тегами
-    const ids = chunk.map((id) => `filter[id][]=${id}`).join('&');
-    const res = await fetch(
-      `${BASE_URL}/api/v4/contacts?${ids}&limit=250`,
-      { headers }
-    );
-
-    if (!res.ok || res.status === 204) continue;
-
-    const data = await res.json();
-    const updates: any[] = [];
-
-    for (const contact of data._embedded?.contacts || []) {
-      const rfmTags = contact._embedded?.tags?.filter((t: any) =>
-        t.name.startsWith('rfm:')
-      );
-      if (rfmTags?.length) {
-        updates.push({
-          id: contact.id,
-          _embedded: {
-            tags: rfmTags.map((t: any) => ({
-              id: t.id,
-              name: t.name,
-              _delete: true,
-            })),
-          },
-        });
-      }
-    }
-
-    if (updates.length > 0) {
-      await fetch(`${BASE_URL}/api/v4/contacts`, {
-        method: 'PATCH',
-        headers,
-        body: JSON.stringify(updates),
-      });
-    }
-
-    await sleep(150);
-  }
 }
 
 // ─── Утилиты ────────────────────────────────────────────

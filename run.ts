@@ -1,11 +1,12 @@
 #!/usr/bin/env npx tsx
 // Основной скрипт RFM-пересчёта. Запускается по cron.
+// Записывает результат в Покупатели → Динамическая сегментация.
 import {
   fetchAllWonDeals,
-  ensureRfmField,
-  getFieldEnums,
-  batchUpdateContacts,
-  removeOldRfmTags,
+  fetchAllCustomers,
+  createCustomers,
+  updateCustomerSegments,
+  SEGMENT_IDS,
 } from './lib/amocrm';
 import { aggregateByContact, calculateSegments } from './lib/rfm';
 
@@ -25,11 +26,11 @@ async function main() {
     return;
   }
 
-  // 2. Агрегируем по контакту
+  // 2. Агрегируем по контакту: R, F, M
   const contactData = aggregateByContact(deals);
   console.log(`[${ts()}] ${contactData.length} unique contacts`);
 
-  // 3. Рассчитываем сегменты
+  // 3. Рассчитываем сегменты с перцентилями
   const segments = calculateSegments(contactData);
 
   const dist: Record<string, number> = {};
@@ -38,29 +39,57 @@ async function main() {
   }
   console.log(`[${ts()}] Segments:`, dist);
 
-  // 4. Создаём/находим поле
-  const fieldId = await ensureRfmField();
-  console.log(`[${ts()}] Field ID: ${fieldId}`);
+  // 4. Загружаем существующих покупателей → map contact_id → customer_id
+  console.log(`[${ts()}] Fetching existing customers...`);
+  const contactToCustomer = await fetchAllCustomers();
+  console.log(`[${ts()}] Found ${contactToCustomer.size} existing customers`);
 
-  // 5. Получаем enum_id
-  const enums = await getFieldEnums(fieldId);
+  // 5. Разделяем: у кого есть покупатель, у кого нет
+  const segmentMap = new Map(segments.map((s) => [s.contactId, s.segment]));
+  const withCustomer: Array<{ customerId: number; segment: string }> = [];
+  const withoutCustomer: number[] = [];
 
-  // 6. Удаляем старые rfm: теги
-  const contactIds = segments.map((s) => s.contactId);
-  console.log(`[${ts()}] Removing old tags...`);
-  await removeOldRfmTags(contactIds);
+  for (const s of segments) {
+    const custId = contactToCustomer.get(s.contactId);
+    if (custId) {
+      withCustomer.push({ customerId: custId, segment: s.segment });
+    } else {
+      withoutCustomer.push(s.contactId);
+    }
+  }
 
-  // 7. Обновляем контакты
-  const updates = segments
-    .map((s) => {
-      const enumId = enums.get(s.segment);
-      if (!enumId) return null;
-      return { contactId: s.contactId, segment: s.segment, fieldId, enumId };
+  console.log(`[${ts()}] With customer: ${withCustomer.length}, need to create: ${withoutCustomer.length}`);
+
+  // 6. Создаём покупателей для контактов без них
+  if (withoutCustomer.length > 0) {
+    console.log(`[${ts()}] Creating ${withoutCustomer.length} new customers...`);
+    const created = await createCustomers(withoutCustomer, segmentMap);
+    console.log(`[${ts()}] Created ${created.size} customers`);
+
+    // Добавляем в список на обновление (у новых сегмент уже задан при создании)
+    // Но на всякий случай обновим и их тоже
+    for (const [contactId, customerId] of created) {
+      const segment = segmentMap.get(contactId);
+      if (segment) {
+        withCustomer.push({ customerId, segment });
+      }
+    }
+  }
+
+  // 7. Обновляем сегменты у всех покупателей
+  const updates = withCustomer
+    .map((u) => {
+      const segmentId = SEGMENT_IDS[u.segment];
+      if (!segmentId) {
+        console.warn(`Unknown segment: "${u.segment}"`);
+        return null;
+      }
+      return { customerId: u.customerId, segmentId };
     })
     .filter((u): u is NonNullable<typeof u> => u !== null);
 
-  console.log(`[${ts()}] Updating ${updates.length} contacts...`);
-  const updated = await batchUpdateContacts(updates);
+  console.log(`[${ts()}] Updating ${updates.length} customer segments...`);
+  const updated = await updateCustomerSegments(updates);
 
   console.log(`[${ts()}] Done. Updated: ${updated}/${segments.length}`);
   console.log(`[${ts()}] Distribution:`, dist);
