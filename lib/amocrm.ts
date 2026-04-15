@@ -12,20 +12,31 @@ async function sleep(ms: number) {
 
 const CONCURRENT = 2;
 
-// Обёртка fetch с retry на 429 и 403 (nginx rate limit / временный бан)
+// Обёртка fetch с retry на 429/403 и сетевые ошибки
 async function fetchWithRetry(
   url: string,
   init?: RequestInit,
   maxRetries = 6
 ): Promise<Response> {
+  let lastError: any = null;
+
   for (let attempt = 0; attempt < maxRetries; attempt++) {
-    const res = await fetch(url, init);
-    if (res.status !== 429 && res.status !== 403) return res;
-    // Exponential backoff: 2s, 4s, 8s, 16s, 32s, 64s
-    const wait = 2000 * Math.pow(2, attempt);
-    console.warn(`  ${res.status} received, waiting ${wait}ms (attempt ${attempt + 1}/${maxRetries})`);
-    await sleep(wait);
+    try {
+      const res = await fetch(url, init);
+      if (res.status !== 429 && res.status !== 403) return res;
+      const wait = 2000 * Math.pow(2, attempt);
+      console.warn(`  ${res.status} received, waiting ${wait}ms (attempt ${attempt + 1}/${maxRetries})`);
+      await sleep(wait);
+    } catch (err: any) {
+      // Сетевые ошибки (socket closed, timeout, DNS)
+      lastError = err;
+      const wait = 2000 * Math.pow(2, attempt);
+      console.warn(`  Network error (${err.cause?.code || err.code || 'unknown'}), waiting ${wait}ms (attempt ${attempt + 1}/${maxRetries})`);
+      await sleep(wait);
+    }
   }
+
+  if (lastError) throw lastError;
   return fetch(url, init);
 }
 
@@ -94,28 +105,32 @@ export async function fetchCustomersWithPurchases(): Promise<CustomerData[]> {
 
   for (const chunk of chunks) {
     const promises = chunk.map(async (cust) => {
-      const url = `${BASE_URL}/api/v4/customers/${cust.id}/transactions?limit=1`;
-      const res = await fetchWithRetry(url, { headers });
+      try {
+        const url = `${BASE_URL}/api/v4/customers/${cust.id}/transactions?limit=1`;
+        const res = await fetchWithRetry(url, { headers });
 
-      if (!res.ok || res.status === 204) return null;
+        if (!res.ok || res.status === 204) return null;
 
-      const data = await res.json();
-      const txns = data?._embedded?.transactions || [];
+        const data = await res.json();
+        const txns = data?._embedded?.transactions || [];
 
-      if (txns.length === 0) return null;
+        if (txns.length === 0) return null;
 
-      // Берём самую свежую транзакцию (API возвращает desc по умолчанию)
-      const lastTx = txns.reduce(
-        (max: any, tx: any) => (tx.completed_at > max.completed_at ? tx : max),
-        txns[0]
-      );
+        const lastTx = txns.reduce(
+          (max: any, tx: any) => (tx.completed_at > max.completed_at ? tx : max),
+          txns[0]
+        );
 
-      return {
-        customerId: cust.id,
-        ltv: cust.ltv,
-        purchasesCount: cust.purchasesCount,
-        lastPurchaseAt: lastTx.completed_at,
-      };
+        return {
+          customerId: cust.id,
+          ltv: cust.ltv,
+          purchasesCount: cust.purchasesCount,
+          lastPurchaseAt: lastTx.completed_at,
+        };
+      } catch (err: any) {
+        console.warn(`  Skip customer ${cust.id}: ${err.message}`);
+        return null;
+      }
     });
 
     const results = await Promise.all(promises);
@@ -123,7 +138,7 @@ export async function fetchCustomersWithPurchases(): Promise<CustomerData[]> {
       if (r) result.push(r);
     }
 
-    await sleep(200);
+    await sleep(300);
   }
 
   return result;

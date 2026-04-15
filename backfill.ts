@@ -20,14 +20,22 @@ async function fetchWithRetry(
   init?: RequestInit,
   maxRetries = 6
 ): Promise<Response> {
+  let lastError: any = null;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
-    const res = await fetch(url, init);
-    // 429 = rate limit, 403 = временный nginx-бан за спам
-    if (res.status !== 429 && res.status !== 403) return res;
-    const wait = 2000 * Math.pow(2, attempt); // 2s, 4s, 8s, 16s, 32s, 64s
-    console.warn(`  ${res.status} received, waiting ${wait}ms (attempt ${attempt + 1}/${maxRetries})`);
-    await sleep(wait);
+    try {
+      const res = await fetch(url, init);
+      if (res.status !== 429 && res.status !== 403) return res;
+      const wait = 2000 * Math.pow(2, attempt);
+      console.warn(`  ${res.status} received, waiting ${wait}ms (attempt ${attempt + 1}/${maxRetries})`);
+      await sleep(wait);
+    } catch (err: any) {
+      lastError = err;
+      const wait = 2000 * Math.pow(2, attempt);
+      console.warn(`  Network error (${err.cause?.code || err.code || 'unknown'}), waiting ${wait}ms (attempt ${attempt + 1}/${maxRetries})`);
+      await sleep(wait);
+    }
   }
+  if (lastError) throw lastError;
   return fetch(url, init);
 }
 
