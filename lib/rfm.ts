@@ -1,4 +1,5 @@
 import type { CustomerData } from './amocrm';
+import { saveThresholds, percentRank } from './thresholds';
 
 // ─── Типы ───────────────────────────────────────────────
 
@@ -41,23 +42,28 @@ function percentRankInc(values: number[], target: number): number {
 // ─── Рассчитать сегменты из данных покупателей ──────────
 
 export function calculateSegments(customers: CustomerData[]): CustomerSegment[] {
-  const now = Date.now() / 1000; // unix seconds
+  const now = Date.now() / 1000;
 
-  // Считаем дни с последней покупки для каждого
   const withDays = customers.map((c) => ({
     ...c,
     daysSince: Math.floor((now - c.lastPurchaseAt) / 86400),
   }));
 
-  // Активная база (до 730 дней) для расчёта перцентилей
   const activeBase = withDays.filter((c) => c.daysSince <= 730);
+  const revenues = activeBase.map((c) => c.ltv).sort((a, b) => a - b);
+  const frequencies = activeBase.map((c) => c.purchasesCount).sort((a, b) => a - b);
 
-  const revenues = activeBase.map((c) => c.ltv);
-  const frequencies = activeBase.map((c) => c.purchasesCount);
+  // Сохраняем пороги для быстрых одиночных пересчётов
+  saveThresholds({
+    updatedAt: new Date().toISOString(),
+    baseSize: activeBase.length,
+    revenues,
+    frequencies,
+  });
 
   return withDays.map((c) => {
-    const revPct = percentRankInc(revenues, c.ltv);
-    const freqPct = percentRankInc(frequencies, c.purchasesCount);
+    const revPct = percentRank(revenues, c.ltv);
+    const freqPct = percentRank(frequencies, c.purchasesCount);
 
     const segment = assignSegment(c.daysSince, revPct, freqPct);
 
@@ -71,6 +77,23 @@ export function calculateSegments(customers: CustomerData[]): CustomerSegment[] 
       frequencyPercentile: Math.round(freqPct * 100),
     };
   });
+}
+
+// ─── Сегмент для одного покупателя (использует кэш) ──────
+
+export function calculateSingleSegment(
+  ltv: number,
+  purchasesCount: number,
+  lastPurchaseAt: number,
+  revenues: number[],
+  frequencies: number[]
+): { segment: RfmSegment; daysSince: number; revPct: number; freqPct: number } {
+  const now = Date.now() / 1000;
+  const daysSince = Math.floor((now - lastPurchaseAt) / 86400);
+  const revPct = percentRank(revenues, ltv);
+  const freqPct = percentRank(frequencies, purchasesCount);
+  const segment = assignSegment(daysSince, revPct, freqPct);
+  return { segment, daysSince, revPct, freqPct };
 }
 
 // ─── Дерево решений из документа ────────────────────────

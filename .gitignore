@@ -5,3 +5,4 @@ dist/
 .env.local
 test-*.ts
 .omc/
+.thresholds.json

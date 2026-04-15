@@ -1,75 +1,79 @@
 #!/usr/bin/env npx tsx
 // HTTP-сервер для приёма вебхуков от amoCRM.
-// При получении вебхука запускает полный пересчёт RFM.
-// Запуск: npx tsx server.ts
+// При получении вебхука запускает быстрый пересчёт ОДНОЙ сделки (run-single.ts).
+// Полный пересчёт — через cron в 02:00.
 // Порт: 3939 (или PORT env)
 
 import { createServer } from 'http';
 import { exec } from 'child_process';
 
 const PORT = parseInt(process.env.PORT || '3939');
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 
-let isRunning = false;
-let lastRun = 0;
-const DEBOUNCE_MS = 30_000; // не чаще раза в 30 сек
+function ts() {
+  return new Date().toISOString().replace('T', ' ').slice(0, 19);
+}
 
-function runRfm() {
-  if (isRunning) {
-    console.log(`[${ts()}] Recalc already running, skipping`);
-    return;
-  }
+// Распарсить form-encoded webhook body amoCRM
+function parseLeadId(body: string): number | null {
+  // amoCRM отправляет form-encoded: leads[status][0][id]=123456
+  const decoded = decodeURIComponent(body.replace(/\+/g, ' '));
+  const m = decoded.match(/leads\[status\]\[\d+\]\[id\]=(\d+)/);
+  if (m) return parseInt(m[1]);
 
-  const now = Date.now();
-  if (now - lastRun < DEBOUNCE_MS) {
-    console.log(`[${ts()}] Debounce: last run ${((now - lastRun) / 1000).toFixed(0)}s ago, skipping`);
-    return;
-  }
+  // Ещё одна форма: leads[add][0][id]=...
+  const m2 = decoded.match(/leads\[\w+\]\[\d+\]\[id\]=(\d+)/);
+  if (m2) return parseInt(m2[1]);
 
-  isRunning = true;
-  lastRun = now;
-  console.log(`[${ts()}] Starting RFM recalculation...`);
+  return null;
+}
 
+function runSingleRecalc(leadId: number) {
   const env = { ...process.env };
-  exec('npx tsx run.ts', { cwd: __dirname, env }, (err, stdout, stderr) => {
-    isRunning = false;
+  console.log(`[${ts()}] Running single recalc for lead #${leadId}`);
+
+  exec(`npx tsx run-single.ts ${leadId}`, { cwd: __dirname, env }, (err, stdout, stderr) => {
     if (err) {
-      console.error(`[${ts()}] RFM error:`, stderr || err.message);
+      console.error(`[${ts()}] Single recalc error: ${stderr || err.message}`);
     } else {
-      console.log(`[${ts()}] RFM done:\n${stdout}`);
+      console.log(`[${ts()}] Single recalc done:\n${stdout}`);
     }
   });
 }
 
-function ts() {
-  return new Date().toISOString().replace('T', ' ').slice(0, 19);
+function runFullRecalc() {
+  const env = { ...process.env };
+  console.log(`[${ts()}] Running FULL recalc`);
+
+  exec('npx tsx run.ts', { cwd: __dirname, env }, (err, stdout, stderr) => {
+    if (err) {
+      console.error(`[${ts()}] Full recalc error: ${stderr || err.message}`);
+    } else {
+      console.log(`[${ts()}] Full recalc done:\n${stdout.slice(-1500)}`);
+    }
+  });
 }
 
 const server = createServer((req, res) => {
   // Health check
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', isRunning, lastRun: new Date(lastRun).toISOString() }));
+    res.end(JSON.stringify({ status: 'ok' }));
     return;
   }
 
-  // Webhook от amoCRM (POST)
+  // Webhook от amoCRM
   if (req.method === 'POST' && req.url === '/webhook') {
     let body = '';
     req.on('data', (chunk) => (body += chunk));
     req.on('end', () => {
-      console.log(`[${ts()}] Webhook received (${body.length} bytes)`);
+      const leadId = parseLeadId(body);
+      console.log(`[${ts()}] Webhook received (${body.length} bytes), lead=${leadId || 'unknown'}`);
 
-      // Опциональная проверка секрета
-      if (WEBHOOK_SECRET && !req.url?.includes(WEBHOOK_SECRET)) {
-        // Проверяем и в query string
-        const url = new URL(req.url || '/', `http://localhost`);
-        if (url.searchParams.get('secret') !== WEBHOOK_SECRET) {
-          // Без секрета — всё равно принимаем (amoCRM не поддерживает кастомные заголовки)
-        }
+      if (leadId) {
+        runSingleRecalc(leadId);
+      } else {
+        console.warn(`[${ts()}] Could not parse lead_id from webhook. Body: ${body.slice(0, 200)}`);
       }
-
-      runRfm();
 
       res.writeHead(200);
       res.end('ok');
@@ -77,12 +81,26 @@ const server = createServer((req, res) => {
     return;
   }
 
-  // Ручной запуск
-  if (req.method === 'POST' && req.url === '/run') {
-    console.log(`[${ts()}] Manual run triggered`);
-    runRfm();
+  // Ручной полный пересчёт
+  if (req.method === 'POST' && req.url === '/run-full') {
+    console.log(`[${ts()}] Manual FULL recalc triggered`);
+    runFullRecalc();
     res.writeHead(200);
     res.end('started');
+    return;
+  }
+
+  // Ручной одиночный пересчёт
+  if (req.method === 'POST' && req.url?.startsWith('/run-single/')) {
+    const leadId = parseInt(req.url.split('/').pop() || '');
+    if (leadId) {
+      runSingleRecalc(leadId);
+      res.writeHead(200);
+      res.end(`started for lead ${leadId}`);
+    } else {
+      res.writeHead(400);
+      res.end('invalid lead_id');
+    }
     return;
   }
 
@@ -92,7 +110,8 @@ const server = createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`[${ts()}] RFM webhook server listening on port ${PORT}`);
-  console.log(`  Webhook URL: http://<VDS_IP>:${PORT}/webhook`);
-  console.log(`  Health:      http://<VDS_IP>:${PORT}/health`);
-  console.log(`  Manual run:  curl -X POST http://<VDS_IP>:${PORT}/run`);
+  console.log(`  Webhook:       POST http://<VDS_IP>:${PORT}/webhook`);
+  console.log(`  Full recalc:   POST http://<VDS_IP>:${PORT}/run-full`);
+  console.log(`  Single recalc: POST http://<VDS_IP>:${PORT}/run-single/<lead_id>`);
+  console.log(`  Health:        GET  http://<VDS_IP>:${PORT}/health`);
 });
