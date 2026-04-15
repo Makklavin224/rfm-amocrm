@@ -1,6 +1,6 @@
-// Одноразовый скрипт: подгружает исторические продажи из сделок
-// "Физ. отдел" как транзакции в существующих покупателей.
-// Использует external_id = "deal_{id}" для идемпотентности.
+// Одноразовый скрипт: для каждого контакта с выигранной сделкой в "Физ. отдел"
+// создаёт покупателя (если нет), привязывает контакт, добавляет транзакции.
+// Идемпотентный: через маркер [DEAL:X] в comment транзакции.
 
 const BASE_URL = process.env.AMO_BASE_URL!;
 const TOKEN = process.env.AMO_TOKEN!;
@@ -96,7 +96,91 @@ async function fetchContactToCustomer(): Promise<Map<number, number>> {
   return map;
 }
 
-// ─── Получить уже импортированные deal_id из комментариев ─
+// ─── Получить имена контактов ────────────────────────────
+
+async function fetchContactNames(
+  contactIds: number[]
+): Promise<Map<number, string>> {
+  const names = new Map<number, string>();
+  const chunkSize = 50;
+
+  for (let i = 0; i < contactIds.length; i += chunkSize) {
+    const chunk = contactIds.slice(i, i + chunkSize);
+    const q = chunk.map((id) => `filter[id][]=${id}`).join('&');
+    const res = await fetch(
+      `${BASE_URL}/api/v4/contacts?${q}&limit=250`,
+      { headers }
+    );
+
+    if (res.ok) {
+      const data = await res.json();
+      for (const c of data?._embedded?.contacts || []) {
+        names.set(c.id, c.name || `Контакт #${c.id}`);
+      }
+    }
+
+    await sleep(150);
+  }
+
+  return names;
+}
+
+// ─── Создать покупателей для контактов ───────────────────
+
+async function createCustomersForContacts(
+  contactIds: number[],
+  nameMap: Map<number, string>
+): Promise<Map<number, number>> {
+  const created = new Map<number, number>();
+  const chunkSize = 50;
+
+  for (let i = 0; i < contactIds.length; i += chunkSize) {
+    const chunk = contactIds.slice(i, i + chunkSize);
+    const body = chunk.map((cid) => ({
+      name: nameMap.get(cid) || `Контакт #${cid}`,
+    }));
+
+    const res = await fetch(`${BASE_URL}/api/v4/customers`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      console.error(`Create customers error: ${res.status} ${text.slice(0, 200)}`);
+      continue;
+    }
+
+    const data = await res.json();
+    const customers = data?._embedded?.customers || [];
+
+    // В ответе порядок совпадает с запросом
+    for (let j = 0; j < customers.length && j < chunk.length; j++) {
+      created.set(chunk[j], customers[j].id);
+    }
+
+    await sleep(300);
+
+    // Линкуем контакты к покупателям
+    for (let j = 0; j < chunk.length; j++) {
+      const customerId = created.get(chunk[j]);
+      if (!customerId) continue;
+      await fetch(`${BASE_URL}/api/v4/customers/${customerId}/link`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify([
+          { to_entity_id: chunk[j], to_entity_type: 'contacts' },
+        ]),
+      });
+      await sleep(100);
+    }
+  }
+
+  return created;
+}
+
+// ─── Получить импортированные deal_id ────────────────────
 
 async function fetchImportedDealIds(
   customerId: number
@@ -170,11 +254,35 @@ async function main() {
   console.log(`[${ts()}] Loaded ${deals.length} won deals`);
 
   // 2. Карта contact → customer
-  console.log(`[${ts()}] Fetching customers with contacts...`);
+  console.log(`[${ts()}] Fetching existing customers...`);
   const contactToCustomer = await fetchContactToCustomer();
-  console.log(`[${ts()}] Found ${contactToCustomer.size} contact→customer links`);
+  console.log(`[${ts()}] Found ${contactToCustomer.size} existing contact→customer links`);
 
-  // 3. Группируем сделки по customer_id
+  // 3. Уникальные контакты с продажами
+  const uniqueContacts = [...new Set(deals.map((d) => d.contact_id))];
+  console.log(`[${ts()}] Unique contacts with sales: ${uniqueContacts.length}`);
+
+  // 4. Контакты без покупателя → создать
+  const contactsWithoutCustomer = uniqueContacts.filter(
+    (cid) => !contactToCustomer.has(cid)
+  );
+  console.log(`[${ts()}] Contacts needing customer creation: ${contactsWithoutCustomer.length}`);
+
+  if (contactsWithoutCustomer.length > 0) {
+    console.log(`[${ts()}] Fetching contact names...`);
+    const names = await fetchContactNames(contactsWithoutCustomer);
+
+    console.log(`[${ts()}] Creating customers...`);
+    const created = await createCustomersForContacts(contactsWithoutCustomer, names);
+    console.log(`[${ts()}] Created ${created.size} new customers`);
+
+    // Добавляем в общую карту
+    for (const [contactId, customerId] of created) {
+      contactToCustomer.set(contactId, customerId);
+    }
+  }
+
+  // 5. Группируем сделки по customer_id
   const byCustomer = new Map<number, Deal[]>();
   let orphans = 0;
 
@@ -188,9 +296,9 @@ async function main() {
     byCustomer.get(customerId)!.push(deal);
   }
 
-  console.log(`[${ts()}] Grouped: ${byCustomer.size} customers, ${orphans} orphan deals (no customer)`);
+  console.log(`[${ts()}] Grouped: ${byCustomer.size} customers, ${orphans} orphan deals`);
 
-  // 4. Для каждого покупателя добавляем транзакции
+  // 6. Добавляем транзакции
   let totalAdded = 0;
   let totalSkipped = 0;
   let processed = 0;
@@ -204,7 +312,6 @@ async function main() {
   for (const chunk of chunks) {
     await Promise.all(
       chunk.map(async ([customerId, customerDeals]) => {
-        // Идемпотентность: смотрим уже импортированные по [DEAL:X] в comment
         const importedIds = await fetchImportedDealIds(customerId);
 
         const toAdd = customerDeals
@@ -225,8 +332,8 @@ async function main() {
     );
 
     processed += chunk.length;
-    if (processed % 25 === 0) {
-      console.log(`[${ts()}] ${processed}/${byCustomer.size} customers processed (added: ${totalAdded})`);
+    if (processed % 50 === 0) {
+      console.log(`[${ts()}] ${processed}/${byCustomer.size} customers done (added: ${totalAdded})`);
     }
 
     await sleep(300);
@@ -236,7 +343,7 @@ async function main() {
   console.log(`  Customers processed: ${byCustomer.size}`);
   console.log(`  Transactions added:  ${totalAdded}`);
   console.log(`  Transactions skipped (already imported): ${totalSkipped}`);
-  console.log(`  Orphan deals (no customer): ${orphans}`);
+  console.log(`  Orphan deals (no contact found): ${orphans}`);
 }
 
 main().catch(console.error);
