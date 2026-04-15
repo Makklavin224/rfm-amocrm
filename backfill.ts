@@ -18,19 +18,20 @@ async function sleep(ms: number) {
 async function fetchWithRetry(
   url: string,
   init?: RequestInit,
-  maxRetries = 5
+  maxRetries = 6
 ): Promise<Response> {
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     const res = await fetch(url, init);
-    if (res.status !== 429) return res;
-    const wait = 1000 * Math.pow(2, attempt);
-    console.warn(`  429 received, waiting ${wait}ms (attempt ${attempt + 1}/${maxRetries})`);
+    // 429 = rate limit, 403 = временный nginx-бан за спам
+    if (res.status !== 429 && res.status !== 403) return res;
+    const wait = 2000 * Math.pow(2, attempt); // 2s, 4s, 8s, 16s, 32s, 64s
+    console.warn(`  ${res.status} received, waiting ${wait}ms (attempt ${attempt + 1}/${maxRetries})`);
     await sleep(wait);
   }
   return fetch(url, init);
 }
 
-const CONCURRENT = 3;
+const CONCURRENT = 2;
 
 interface Deal {
   id: number;

@@ -10,21 +10,20 @@ async function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-const CONCURRENT = 3;
+const CONCURRENT = 2;
 
-// Обёртка fetch с retry на 429 (Too Many Requests)
+// Обёртка fetch с retry на 429 и 403 (nginx rate limit / временный бан)
 async function fetchWithRetry(
   url: string,
   init?: RequestInit,
-  maxRetries = 5
+  maxRetries = 6
 ): Promise<Response> {
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     const res = await fetch(url, init);
-    if (res.status !== 429) return res;
-
-    // Exponential backoff: 1s, 2s, 4s, 8s, 16s
-    const wait = 1000 * Math.pow(2, attempt);
-    console.warn(`  429 received, waiting ${wait}ms (attempt ${attempt + 1}/${maxRetries})`);
+    if (res.status !== 429 && res.status !== 403) return res;
+    // Exponential backoff: 2s, 4s, 8s, 16s, 32s, 64s
+    const wait = 2000 * Math.pow(2, attempt);
+    console.warn(`  ${res.status} received, waiting ${wait}ms (attempt ${attempt + 1}/${maxRetries})`);
     await sleep(wait);
   }
   return fetch(url, init);
