@@ -106,13 +106,13 @@ export function calculateSingleSegment(
 //
 // Пороги (вычисляются на активной базе ≤ 730 дней):
 //   Выручка:    P50, P90
-//   Частота:    P80, P90
+//   Частота:    P80
 //
 // Сегменты:
-//   VIP              revenue ≥ P90  AND purchases > P80
-//   Киты             revenue ≥ P90  AND purchases ≤ P80
-//   Лояльные         P50 ≤ revenue < P90  AND purchases > P90
-//   Перспективные    P50 ≤ revenue < P90  AND purchases ≤ P90
+//   VIP              revenue ≥ P90  AND purchases ≥ P80
+//   Киты             revenue ≥ P90  AND purchases < P80
+//   Лояльные         P50 ≤ revenue < P90  AND purchases ≥ P80
+//   Перспективные    P50 ≤ revenue < P90  AND purchases < P80
 //   Новичок          revenue < P50  AND days ≤ 60
 //   В зоне риска     revenue < P50  AND days > 60
 //   VIP/КИТ в оттоке days 391-730 AND revenue ≥ P90
@@ -133,12 +133,12 @@ function assignSegment(
   // Активная база (≤ 390 дней)
   if (revPercentile >= 0.9) {
     // Топ-10% по деньгам
-    return freqPercentile > 0.8 ? 'VIP' : 'Киты';
+    return freqPercentile >= 0.8 ? 'VIP' : 'Киты';
   }
 
   if (revPercentile >= 0.5) {
     // Средний класс (P50-P90 по деньгам)
-    return freqPercentile > 0.9 ? 'Лояльные' : 'Перспективные';
+    return freqPercentile >= 0.8 ? 'Лояльные' : 'Перспективные';
   }
 
   // Нижняя половина по деньгам
