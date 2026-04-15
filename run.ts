@@ -7,7 +7,8 @@ import {
   updateCustomerSegments,
   SEGMENT_IDS,
 } from './lib/amocrm';
-import { calculateSegments } from './lib/rfm';
+import { calculateSegments, getThresholds } from './lib/rfm';
+import { loadThresholds } from './lib/thresholds';
 
 async function main() {
   const start = Date.now();
@@ -27,6 +28,15 @@ async function main() {
 
   // 2. Рассчитываем сегменты с перцентилями
   const segments = calculateSegments(customers);
+
+  // Показываем пороги
+  const cache = loadThresholds();
+  if (cache) {
+    const t = getThresholds(cache.revenues, cache.frequencies);
+    console.log(`[${ts()}] Пороги (активная база ${cache.baseSize}):`);
+    console.log(`  Выручка P50 = ${t.revenueP50.toLocaleString('ru')}₽, P90 = ${t.revenueP90.toLocaleString('ru')}₽`);
+    console.log(`  Частота P80 = ${t.frequencyP80}, P90 = ${t.frequencyP90}`);
+  }
 
   const dist: Record<string, number> = {};
   for (const s of segments) {

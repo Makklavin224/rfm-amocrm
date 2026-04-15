@@ -96,56 +96,85 @@ export function calculateSingleSegment(
   return { segment, daysSince, revPct, freqPct };
 }
 
-// ─── Дерево решений из документа ────────────────────────
+// ─── Дерево решений (ТЗ 2026-04) ────────────────────────
 //
-// Этап 1: > 730 дней → Архив
-// Этап 2: 391-730 дней → проверяем деньги
-//   - Топ-10% по выручке → VIP/КИТ в оттоке
-//   - Остальные → Потерянный
-// Этап 3: ≤ 390 дней → полный анализ
-//   - Топ-10% по выручке (≥ 0.9):
-//     - Частота ≥ 0.5 → VIP
-//     - Частота < 0.5 → Киты
-//   - Топ-50% по выручке (≥ 0.5):
-//     - Частота ≥ 0.5 → Лояльные
-//     - Частота < 0.5 → Перспективные
-//   - Нижние 50%:
-//     - ≤ 60 дней → Новичок
-//     - > 60 дней → В зоне риска
+// Давность (Recency) — те же пороги:
+//   > 730 дней → Архив
+//   391-730 дней → зона оттока (VIP/КИТ в оттоке или Потерянный)
+//   ≤ 390 дней → активная база
+//   ≤ 60 дней → новые (Новичок)
+//
+// Пороги (вычисляются на активной базе ≤ 730 дней):
+//   Выручка:    P50, P90
+//   Частота:    P80, P90
+//
+// Сегменты:
+//   VIP              revenue ≥ P90  AND purchases > P80
+//   Киты             revenue ≥ P90  AND purchases ≤ P80
+//   Лояльные         P50 ≤ revenue < P90  AND purchases > P90
+//   Перспективные    P50 ≤ revenue < P90  AND purchases ≤ P90
+//   Новичок          revenue < P50  AND days ≤ 60
+//   В зоне риска     revenue < P50  AND days > 60
+//   VIP/КИТ в оттоке days 391-730 AND revenue ≥ P90
+//   Потерянный       days 391-730 AND revenue < P90
+//   Архив            days > 730
 
 function assignSegment(
   daysSince: number,
   revPercentile: number,
   freqPercentile: number
 ): RfmSegment {
-  if (daysSince > 730) {
-    return 'Архив';
-  }
+  if (daysSince > 730) return 'Архив';
 
   if (daysSince > 390) {
-    if (revPercentile >= 0.9) {
-      return 'VIP/КИТ в оттоке';
-    }
-    return 'Потерянный';
+    return revPercentile >= 0.9 ? 'VIP/КИТ в оттоке' : 'Потерянный';
   }
 
+  // Активная база (≤ 390 дней)
   if (revPercentile >= 0.9) {
-    if (freqPercentile >= 0.5) {
-      return 'VIP';
-    }
-    return 'Киты';
+    // Топ-10% по деньгам
+    return freqPercentile > 0.8 ? 'VIP' : 'Киты';
   }
 
   if (revPercentile >= 0.5) {
-    if (freqPercentile >= 0.5) {
-      return 'Лояльные';
-    }
-    return 'Перспективные';
+    // Средний класс (P50-P90 по деньгам)
+    return freqPercentile > 0.9 ? 'Лояльные' : 'Перспективные';
   }
 
-  if (daysSince <= 60) {
-    return 'Новичок';
-  }
+  // Нижняя половина по деньгам
+  return daysSince <= 60 ? 'Новичок' : 'В зоне риска';
+}
 
-  return 'В зоне риска';
+// ─── Пороговые значения (для логов/отображения) ─────────
+
+export interface ThresholdValues {
+  revenueP50: number;
+  revenueP90: number;
+  frequencyP80: number;
+  frequencyP90: number;
+}
+
+export function getThresholds(
+  revenues: number[],
+  frequencies: number[]
+): ThresholdValues {
+  // Google Sheets PERCENTILE: линейная интерполяция
+  const pct = (sorted: number[], p: number): number => {
+    const n = sorted.length;
+    if (n === 0) return 0;
+    if (n === 1) return sorted[0];
+    const idx = p * (n - 1);
+    const lo = Math.floor(idx);
+    const hi = Math.ceil(idx);
+    if (lo === hi) return sorted[lo];
+    const frac = idx - lo;
+    return sorted[lo] * (1 - frac) + sorted[hi] * frac;
+  };
+
+  return {
+    revenueP50: Math.round(pct(revenues, 0.5)),
+    revenueP90: Math.round(pct(revenues, 0.9)),
+    frequencyP80: Math.round(pct(frequencies, 0.8) * 100) / 100,
+    frequencyP90: Math.round(pct(frequencies, 0.9) * 100) / 100,
+  };
 }
