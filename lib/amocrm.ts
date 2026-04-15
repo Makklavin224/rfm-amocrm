@@ -10,7 +10,25 @@ async function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-const CONCURRENT = 5;
+const CONCURRENT = 3;
+
+// Обёртка fetch с retry на 429 (Too Many Requests)
+async function fetchWithRetry(
+  url: string,
+  init?: RequestInit,
+  maxRetries = 5
+): Promise<Response> {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const res = await fetch(url, init);
+    if (res.status !== 429) return res;
+
+    // Exponential backoff: 1s, 2s, 4s, 8s, 16s
+    const wait = 1000 * Math.pow(2, attempt);
+    console.warn(`  429 received, waiting ${wait}ms (attempt ${attempt + 1}/${maxRetries})`);
+    await sleep(wait);
+  }
+  return fetch(url, init);
+}
 
 // ─── Типы ───────────────────────────────────────────────
 
@@ -42,10 +60,14 @@ export async function fetchCustomersWithPurchases(): Promise<CustomerData[]> {
 
   while (true) {
     const url = `${BASE_URL}/api/v4/customers?limit=250&page=${page}`;
-    const res = await fetch(url, { headers });
+    const res = await fetchWithRetry(url, { headers });
 
     if (res.status === 204) break;
-    if (!res.ok) break;
+    if (!res.ok) {
+      const text = await res.text();
+      console.error(`  Customers fetch error page=${page}: ${res.status} ${text.slice(0, 200)}`);
+      break;
+    }
 
     const data = await res.json();
     const items = data?._embedded?.customers || [];
@@ -74,7 +96,7 @@ export async function fetchCustomersWithPurchases(): Promise<CustomerData[]> {
   for (const chunk of chunks) {
     const promises = chunk.map(async (cust) => {
       const url = `${BASE_URL}/api/v4/customers/${cust.id}/transactions?limit=1`;
-      const res = await fetch(url, { headers });
+      const res = await fetchWithRetry(url, { headers });
 
       if (!res.ok || res.status === 204) return null;
 
@@ -129,7 +151,7 @@ export async function updateCustomerSegments(
       },
     }));
 
-    const res = await fetch(`${BASE_URL}/api/v4/customers`, {
+    const res = await fetchWithRetry(`${BASE_URL}/api/v4/customers`, {
       method: 'PATCH',
       headers,
       body: JSON.stringify(body),

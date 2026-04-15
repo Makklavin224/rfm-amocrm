@@ -15,7 +15,22 @@ async function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-const CONCURRENT = 5;
+async function fetchWithRetry(
+  url: string,
+  init?: RequestInit,
+  maxRetries = 5
+): Promise<Response> {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const res = await fetch(url, init);
+    if (res.status !== 429) return res;
+    const wait = 1000 * Math.pow(2, attempt);
+    console.warn(`  429 received, waiting ${wait}ms (attempt ${attempt + 1}/${maxRetries})`);
+    await sleep(wait);
+  }
+  return fetch(url, init);
+}
+
+const CONCURRENT = 3;
 
 interface Deal {
   id: number;
@@ -37,7 +52,7 @@ async function fetchWonDeals(): Promise<Deal[]> {
     const results = await Promise.all(
       pages.map(async (p) => {
         const url = `${BASE_URL}/api/v4/leads?limit=250&page=${p}&with=contacts&filter[statuses][0][pipeline_id]=${PIPELINE_ID}&filter[statuses][0][status_id]=142`;
-        const res = await fetch(url, { headers });
+        const res = await fetchWithRetry(url, { headers });
         if (res.status === 204 || !res.ok) return { leads: [], hasNext: false };
         const data = await res.json();
         return {
@@ -78,7 +93,7 @@ async function fetchContactToCustomer(): Promise<Map<number, number>> {
 
   while (true) {
     const url = `${BASE_URL}/api/v4/customers?limit=250&page=${page}&with=contacts`;
-    const res = await fetch(url, { headers });
+    const res = await fetchWithRetry(url, { headers });
     if (res.status === 204 || !res.ok) break;
     const data = await res.json();
 
@@ -107,7 +122,7 @@ async function fetchContactNames(
   for (let i = 0; i < contactIds.length; i += chunkSize) {
     const chunk = contactIds.slice(i, i + chunkSize);
     const q = chunk.map((id) => `filter[id][]=${id}`).join('&');
-    const res = await fetch(
+    const res = await fetchWithRetry(
       `${BASE_URL}/api/v4/contacts?${q}&limit=250`,
       { headers }
     );
@@ -140,7 +155,7 @@ async function createCustomersForContacts(
       name: nameMap.get(cid) || `Контакт #${cid}`,
     }));
 
-    const res = await fetch(`${BASE_URL}/api/v4/customers`, {
+    const res = await fetchWithRetry(`${BASE_URL}/api/v4/customers`, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
@@ -166,7 +181,7 @@ async function createCustomersForContacts(
     for (let j = 0; j < chunk.length; j++) {
       const customerId = created.get(chunk[j]);
       if (!customerId) continue;
-      await fetch(`${BASE_URL}/api/v4/customers/${customerId}/link`, {
+      await fetchWithRetry(`${BASE_URL}/api/v4/customers/${customerId}/link`, {
         method: 'POST',
         headers,
         body: JSON.stringify([
@@ -190,7 +205,7 @@ async function fetchImportedDealIds(
 
   while (true) {
     const url = `${BASE_URL}/api/v4/customers/${customerId}/transactions?limit=250&page=${page}`;
-    const res = await fetch(url, { headers });
+    const res = await fetchWithRetry(url, { headers });
     if (res.status === 204 || !res.ok) break;
     const data = await res.json();
 
@@ -216,7 +231,7 @@ async function addTransactions(
 ): Promise<number> {
   if (txs.length === 0) return 0;
 
-  const res = await fetch(
+  const res = await fetchWithRetry(
     `${BASE_URL}/api/v4/customers/${customerId}/transactions`,
     {
       method: 'POST',
