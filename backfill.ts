@@ -1,10 +1,19 @@
-// Одноразовый скрипт: для каждого контакта с выигранной сделкой в "Физ. отдел"
+// Одноразовый скрипт: для каждого контакта с выигранной сделкой
 // создаёт покупателя (если нет), привязывает контакт, добавляет транзакции.
 // Идемпотентный: через маркер [DEAL:X] в comment транзакции.
 
 const BASE_URL = process.env.AMO_BASE_URL!;
 const TOKEN = process.env.AMO_TOKEN!;
-const PIPELINE_ID = process.env.AMO_PIPELINE_ID || '379278';
+
+// Все воронки с продажами
+const PIPELINE_IDS = [
+  379278,   // Физ. отдел
+  1281274,  // Постоянные клиенты клининг
+  8499814,  // Старая база
+  8442166,  // Самара2 Копия
+  7980450,  // Химчистка
+  7980474,  // Мойка фасадов
+];
 
 const headers = {
   Authorization: `Bearer ${TOKEN}`,
@@ -48,9 +57,9 @@ interface Deal {
   contact_id: number;
 }
 
-// ─── Загружаем выигранные сделки из "Физ. отдел" ───────
+// ─── Загружаем выигранные сделки из всех воронок ────────
 
-async function fetchWonDeals(): Promise<Deal[]> {
+async function fetchWonDealsFromPipeline(pipelineId: number): Promise<Deal[]> {
   const deals: Deal[] = [];
   let page = 1;
   let keepGoing = true;
@@ -60,7 +69,7 @@ async function fetchWonDeals(): Promise<Deal[]> {
 
     const results = await Promise.all(
       pages.map(async (p) => {
-        const url = `${BASE_URL}/api/v4/leads?limit=250&page=${p}&with=contacts&filter[statuses][0][pipeline_id]=${PIPELINE_ID}&filter[statuses][0][status_id]=142`;
+        const url = `${BASE_URL}/api/v4/leads?limit=250&page=${p}&with=contacts&filter[statuses][0][pipeline_id]=${pipelineId}&filter[statuses][0][status_id]=142`;
         const res = await fetchWithRetry(url, { headers });
         if (res.status === 204 || !res.ok) return { leads: [], hasNext: false };
         const data = await res.json();
@@ -92,6 +101,19 @@ async function fetchWonDeals(): Promise<Deal[]> {
   }
 
   return deals;
+}
+
+async function fetchWonDeals(): Promise<Deal[]> {
+  const allDeals: Deal[] = [];
+
+  for (const pipelineId of PIPELINE_IDS) {
+    console.log(`  Pipeline ${pipelineId}...`);
+    const deals = await fetchWonDealsFromPipeline(pipelineId);
+    console.log(`    → ${deals.length} won deals`);
+    allDeals.push(...deals);
+  }
+
+  return allDeals;
 }
 
 // ─── Map: contact_id → customer_id ───────────────────────
