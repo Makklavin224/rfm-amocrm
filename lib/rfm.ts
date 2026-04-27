@@ -16,6 +16,7 @@ export type RfmSegment =
 
 export interface CustomerSegment {
   customerId: number;
+  contactId: number | null;
   segment: RfmSegment;
   daysSinceLastPurchase: number;
   purchaseCount: number;
@@ -69,6 +70,7 @@ export function calculateSegments(customers: CustomerData[]): CustomerSegment[] 
 
     return {
       customerId: c.customerId,
+      contactId: c.contactId,
       segment,
       daysSinceLastPurchase: c.daysSince,
       purchaseCount: c.purchasesCount,

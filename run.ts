@@ -5,6 +5,7 @@
 import {
   fetchCustomersWithPurchases,
   updateCustomerSegments,
+  updateContactSegments,
   SEGMENT_IDS,
 } from './lib/amocrm';
 import { calculateSegments, getThresholds } from './lib/rfm';
@@ -59,7 +60,17 @@ async function main() {
   console.log(`[${ts()}] Updating ${updates.length} customer segments...`);
   const updated = await updateCustomerSegments(updates);
 
-  console.log(`[${ts()}] Done. Updated: ${updated}/${segments.length}`);
+  console.log(`[${ts()}] Customers updated: ${updated}/${segments.length}`);
+
+  // 4. Обновляем контакты: поле "RFM-сегмент" + тег
+  const contactUpdates = segments
+    .filter((s) => s.contactId)
+    .map((s) => ({ contactId: s.contactId!, segment: s.segment }));
+
+  console.log(`[${ts()}] Updating ${contactUpdates.length} contacts (field + tag)...`);
+  const contactsUpdated = await updateContactSegments(contactUpdates);
+
+  console.log(`[${ts()}] Done. Contacts updated: ${contactsUpdated}`);
   console.log(`[${ts()}] Distribution:`, dist);
 }
 

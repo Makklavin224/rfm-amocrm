@@ -3,7 +3,7 @@
 // Использует кэшированные перцентили из .thresholds.json.
 // Usage: npx tsx run-single.ts <lead_id>
 
-import { SEGMENT_IDS } from './lib/amocrm';
+import { SEGMENT_IDS, updateContactSegments } from './lib/amocrm';
 import { calculateSingleSegment } from './lib/rfm';
 import { loadThresholds } from './lib/thresholds';
 
@@ -139,12 +139,18 @@ async function main() {
   });
 
   if (patchRes.ok) {
-    console.log(`[${ts()}] Done. Customer #${customerId} → segment "${segment}" (${segmentId})`);
+    console.log(`[${ts()}] Customer #${customerId} → segment "${segment}" (${segmentId})`);
   } else {
     const text = await patchRes.text();
-    console.error(`[${ts()}] PATCH failed: ${patchRes.status} ${text}`);
-    process.exit(1);
+    console.error(`[${ts()}] Customer PATCH failed: ${patchRes.status} ${text}`);
   }
+
+  // 7. PATCH контакта: поле "RFM-сегмент" + тег
+  const contactsUpdated = await updateContactSegments([
+    { contactId, segment },
+  ]);
+  console.log(`[${ts()}] Done. Contact #${contactId} → "${segment}" (updated: ${contactsUpdated})`);
+
 }
 
 main().catch((err) => {
