@@ -123,27 +123,38 @@ export async function fetchCustomersWithPurchases(): Promise<CustomerData[]> {
   for (const chunk of chunks) {
     const promises = chunk.map(async (cust) => {
       try {
-        const url = `${BASE_URL}/api/v4/customers/${cust.id}/transactions?limit=1`;
-        const res = await fetchWithRetry(url, { headers });
+        // Загружаем ВСЕ транзакции чтобы найти реальную дату последней покупки
+        let maxCompletedAt = 0;
+        let txPage = 1;
 
-        if (!res.ok || res.status === 204) return null;
+        while (true) {
+          const url = `${BASE_URL}/api/v4/customers/${cust.id}/transactions?limit=250&page=${txPage}`;
+          const res = await fetchWithRetry(url, { headers });
 
-        const data = await res.json();
-        const txns = data?._embedded?.transactions || [];
+          if (!res.ok || res.status === 204) break;
 
-        if (txns.length === 0) return null;
+          const data = await res.json();
+          const txns = data?._embedded?.transactions || [];
 
-        const lastTx = txns.reduce(
-          (max: any, tx: any) => (tx.completed_at > max.completed_at ? tx : max),
-          txns[0]
-        );
+          for (const tx of txns) {
+            if (tx.completed_at > maxCompletedAt) {
+              maxCompletedAt = tx.completed_at;
+            }
+          }
+
+          if (!data._links?.next) break;
+          txPage++;
+          await sleep(150);
+        }
+
+        if (maxCompletedAt === 0) return null;
 
         return {
           customerId: cust.id,
           contactId: cust.contactId,
           ltv: cust.ltv,
           purchasesCount: cust.purchasesCount,
-          lastPurchaseAt: lastTx.completed_at,
+          lastPurchaseAt: maxCompletedAt,
         };
       } catch (err: any) {
         console.warn(`  Skip customer ${cust.id}: ${err.message}`);
@@ -209,6 +220,19 @@ export interface ContactSegmentUpdate {
   segment: string;
 }
 
+// Все возможные rfm: теги (для очистки старых)
+const ALL_RFM_TAGS = [
+  'rfm:vip',
+  'rfm:киты',
+  'rfm:лояльные',
+  'rfm:перспективные',
+  'rfm:новичок',
+  'rfm:в-зоне-риска',
+  'rfm:vip-кит-в-оттоке',
+  'rfm:потерянный',
+  'rfm:архив',
+];
+
 export async function updateContactSegments(
   updates: ContactSegmentUpdate[]
 ): Promise<number> {
@@ -218,13 +242,17 @@ export async function updateContactSegments(
   for (const chunk of chunks) {
     const body = chunk.map((u) => {
       const enumId = RFM_ENUM_IDS[u.segment];
-      const tagName = `rfm:${u.segment.toLowerCase().replace(/[\s\/]/g, '-')}`;
+      const newTag = `rfm:${u.segment.toLowerCase().replace(/[\s\/]/g, '-')}`;
+
+      // Удаляем все rfm: теги кроме нового, добавляем новый
+      const tags: any[] = ALL_RFM_TAGS
+        .filter((t) => t !== newTag)
+        .map((t) => ({ name: t, _delete: true }));
+      tags.push({ name: newTag });
 
       const patch: any = {
         id: u.contactId,
-        _embedded: {
-          tags: [{ name: tagName }],
-        },
+        _embedded: { tags },
       };
 
       if (enumId) {
