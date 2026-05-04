@@ -233,6 +233,25 @@ const ALL_RFM_TAGS = [
   'rfm:архив',
 ];
 
+// Получить текущие теги для списка контактов (одним запросом по filter[id][])
+async function fetchContactTags(
+  contactIds: number[]
+): Promise<Map<number, Array<{ id: number; name: string }>>> {
+  const out = new Map<number, Array<{ id: number; name: string }>>();
+  for (const id of contactIds) out.set(id, []);
+
+  const q = contactIds.map((id) => `filter[id][]=${id}`).join('&');
+  const url = `${BASE_URL}/api/v4/contacts?${q}&limit=250&with=tags`;
+  const res = await fetchWithRetry(url, { headers });
+  if (!res.ok) return out;
+  const data = await res.json();
+  for (const c of data?._embedded?.contacts || []) {
+    const tags = (c._embedded?.tags || []).map((t: any) => ({ id: t.id, name: t.name }));
+    out.set(c.id, tags);
+  }
+  return out;
+}
+
 export async function updateContactSegments(
   updates: ContactSegmentUpdate[]
 ): Promise<number> {
@@ -240,15 +259,20 @@ export async function updateContactSegments(
   const chunks = chunkArray(updates, 50);
 
   for (const chunk of chunks) {
+    // 1. Подтягиваем существующие теги контактов в этом батче
+    const tagMap = await fetchContactTags(chunk.map((u) => u.contactId));
+
+    // 2. Строим PATCH-тело: для каждого контакта = (существующие теги без rfm:*) + новый rfm-тег
     const body = chunk.map((u) => {
       const enumId = RFM_ENUM_IDS[u.segment];
       const newTag = `rfm:${u.segment.toLowerCase().replace(/[\s\/]/g, '-')}`;
 
-      // Удаляем все rfm: теги кроме нового, добавляем новый
-      const tags: any[] = ALL_RFM_TAGS
-        .filter((t) => t !== newTag)
-        .map((t) => ({ name: t, _delete: true }));
-      tags.push({ name: newTag });
+      const existing = tagMap.get(u.contactId) || [];
+      const keptTags = existing
+        .filter((t) => !t.name.startsWith('rfm:'))
+        .map((t) => ({ id: t.id }));
+
+      const tags: any[] = [...keptTags, { name: newTag }];
 
       const patch: any = {
         id: u.contactId,
