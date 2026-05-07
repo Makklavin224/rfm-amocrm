@@ -6,3 +6,7 @@ dist/
 test-*.ts
 .omc/
 .thresholds.json
+orphans-*.json
+duplicates-*.json
+empty-customers-backup-*.json
+*.log

@@ -12,6 +12,10 @@ const BASE_URL = process.env.AMO_BASE_URL!;
 const TOKEN = process.env.AMO_TOKEN!;
 const APPLY = process.argv.includes('--apply');
 const CONC = 10;
+const SKIP = (() => {
+  const i = process.argv.indexOf('--skip');
+  return i >= 0 && process.argv[i + 1] ? parseInt(process.argv[i + 1]) : 0;
+})();
 
 const headers = { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -116,9 +120,11 @@ async function main() {
   const start = Date.now();
   const ts = () => `${((Date.now() - start) / 1000).toFixed(1)}s`;
 
-  console.log(`[${ts()}] Mode: ${APPLY ? 'APPLY' : 'DRY-RUN'}, concurrency=${CONC}`);
+  console.log(`[${ts()}] Mode: ${APPLY ? 'APPLY' : 'DRY-RUN'}, concurrency=${CONC}, skip=${SKIP}`);
   console.log(`[${ts()}] Fetching customers...`);
-  const customers = await fetchAllCustomers();
+  const allCustomers = await fetchAllCustomers();
+  const customers = SKIP > 0 ? allCustomers.slice(SKIP) : allCustomers;
+  console.log(`[${ts()}] Total ${allCustomers.length}, scanning ${customers.length} (skipped ${SKIP})`);
   console.log(`[${ts()}] ${customers.length} customers with purchases`);
 
   // Параллельный скан
