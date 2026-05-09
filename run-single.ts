@@ -6,6 +6,8 @@
 import { SEGMENT_IDS, updateContactSegments } from './lib/amocrm';
 import { calculateSingleSegment } from './lib/rfm';
 import { loadThresholds } from './lib/thresholds';
+import { calcTwoYearStats, cutoffTimestamp, Tx } from './lib/two-year-stats';
+import { buildTwoYearFieldsPatch } from './lib/customer-fields';
 
 const BASE_URL = process.env.AMO_BASE_URL!;
 const TOKEN = process.env.AMO_TOKEN!;
@@ -92,38 +94,76 @@ async function main() {
     process.exit(1);
   }
 
-  console.log(`[${ts()}] Customer #${customerId}: ltv=${customerData.ltv}, purchases=${customerData.purchases_count}`);
+  console.log(`[${ts()}] Customer #${customerId}: stored ltv=${customerData.ltv}, purchases=${customerData.purchases_count}`);
 
-  if (!customerData.ltv || !customerData.purchases_count) {
-    console.error('Customer has no purchases yet');
-    process.exit(1);
+  // 4. Получаем ВСЕ транзакции (постранично), считаем 2-летнее окно
+  const allTxns: Tx[] = [];
+  let txPage = 1;
+  while (true) {
+    const r = await fetch(
+      `${BASE_URL}/api/v4/customers/${customerId}/transactions?limit=250&page=${txPage}`,
+      { headers }
+    );
+    if (r.status === 204 || !r.ok) break;
+    const d = await r.json();
+    for (const t of d?._embedded?.transactions || []) {
+      allTxns.push({ id: t.id, price: t.price, completed_at: t.completed_at, comment: t.comment || '' });
+    }
+    if (!d._links?.next) break;
+    txPage++;
   }
 
-  // 4. Получаем дату последней транзакции
-  const txRes = await fetch(
-    `${BASE_URL}/api/v4/customers/${customerId}/transactions?limit=250`,
-    { headers }
-  );
-  const txData = await txRes.json();
-  const txns = txData?._embedded?.transactions || [];
-
-  if (txns.length === 0) {
+  if (allTxns.length === 0) {
     console.error('No transactions found');
     process.exit(1);
   }
 
-  const lastAt = Math.max(...txns.map((t: any) => t.completed_at));
+  const stats = calcTwoYearStats(allTxns);
+  console.log(`[${ts()}] 2y window: count=${stats.count} sum=${stats.sum} avg=${stats.avg} lastAt=${stats.lastAt}`);
 
-  // 5. Считаем сегмент по кэшированным порогам
-  const { segment, daysSince, revPct, freqPct } = calculateSingleSegment(
-    customerData.ltv,
-    customerData.purchases_count,
-    lastAt,
-    thresholds.revenues,
-    thresholds.frequencies
-  );
+  // Обновляем три кастомных поля у покупателя на лету (даже если 0/0/0)
+  const fieldsPatchBody = [{
+    id: customerId,
+    custom_fields_values: buildTwoYearFieldsPatch(stats.sum, stats.count, stats.avg),
+  }];
+  const fpr = await fetch(`${BASE_URL}/api/v4/customers`, {
+    method: 'PATCH',
+    headers,
+    body: JSON.stringify(fieldsPatchBody),
+  });
+  console.log(`[${ts()}] 2y fields patch: ${fpr.status}`);
 
-  console.log(`[${ts()}] Segment: ${segment} (rev:${Math.round(revPct * 100)}%, freq:${Math.round(freqPct * 100)}%, days:${daysSince})`);
+  // 5. Если в окне 2 года нет покупок → Архив
+  let segment: string;
+  let daysSince = 0;
+  let revPct = 0;
+  let freqPct = 0;
+
+  if (stats.count === 0) {
+    segment = 'Архив';
+    console.log(`[${ts()}] No purchases in 2y window → segment "Архив"`);
+  } else {
+    const cutoff = cutoffTimestamp();
+    let firstAt = 0;
+    for (const t of allTxns) {
+      if (t.completed_at < cutoff) continue;
+      if (firstAt === 0 || t.completed_at < firstAt) firstAt = t.completed_at;
+    }
+
+    const out = calculateSingleSegment(
+      stats.sum,
+      stats.count,
+      stats.lastAt,
+      thresholds.revenues,
+      thresholds.frequencies,
+      firstAt
+    );
+    segment = out.segment;
+    daysSince = out.daysSince;
+    revPct = out.revPct;
+    freqPct = out.freqPct;
+    console.log(`[${ts()}] Segment: ${segment} (rev:${Math.round(revPct * 100)}%, freq:${Math.round(freqPct * 100)}%, days:${daysSince}, daysSinceFirst:${out.daysSinceFirst})`);
+  }
 
   // 6. PATCH покупателя
   const segmentId = SEGMENT_IDS[segment];
