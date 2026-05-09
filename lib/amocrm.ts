@@ -1,3 +1,6 @@
+import { CUSTOMER_FIELD_IDS, readNumericField } from './customer-fields';
+import { cutoffTimestamp } from './two-year-stats';
+
 const BASE_URL = process.env.AMO_BASE_URL!;
 const TOKEN = process.env.AMO_TOKEN!;
 
@@ -47,7 +50,8 @@ export interface CustomerData {
   contactId: number | null;
   ltv: number;
   purchasesCount: number;
-  lastPurchaseAt: number; // unix timestamp
+  lastPurchaseAt: number; // unix timestamp, max(completed_at) в окне 730 дней
+  firstPurchaseAtIn2y: number; // unix timestamp, min(completed_at) в окне 730 дней
 }
 
 // ID поля "RFM-сегмент" на контактах (создано ранее)
@@ -77,10 +81,23 @@ export const SEGMENT_IDS: Record<string, number> = {
   'Архив': 129,
 };
 
-// ─── Покупатели: загрузить всех с покупками ─────────────
+// ─── Покупатели: загрузить активных и архивных по 2-летнему окну ───
+//
+// Источник цифр: кастомные поля "Сумма / Кол-во (последние 2 года)".
+// Поля заполняются скриптом recalc-2y-fields.ts (запускается ежедневно).
+//
+// active  — count_2y > 0  (попадают в RFM-расчёт)
+// archive — count_2y == 0 и есть исторические покупки (purchases_count > 0)
+//           → им проставляется сегмент "Архив"
 
-export async function fetchCustomersWithPurchases(): Promise<CustomerData[]> {
-  const customers: Array<{ id: number; contactId: number | null; ltv: number; purchasesCount: number }> = [];
+export interface CustomersForRFM {
+  active: CustomerData[];
+  archive: Array<{ customerId: number; contactId: number | null }>;
+}
+
+export async function fetchCustomersForRFM(): Promise<CustomersForRFM> {
+  const active: Array<{ id: number; contactId: number | null; ltv: number; purchasesCount: number }> = [];
+  const archive: Array<{ customerId: number; contactId: number | null }> = [];
   let page = 1;
 
   while (true) {
@@ -98,15 +115,20 @@ export async function fetchCustomersWithPurchases(): Promise<CustomerData[]> {
     const items = data?._embedded?.customers || [];
 
     for (const cust of items) {
-      if (cust.purchases_count && cust.purchases_count > 0 && cust.ltv) {
-        const mainContact = cust._embedded?.contacts?.[0];
-        customers.push({
-          id: cust.id,
-          contactId: mainContact?.id || null,
-          ltv: cust.ltv,
-          purchasesCount: cust.purchases_count,
-        });
+      const mainContact = cust._embedded?.contacts?.find((c: any) => c.is_main) || cust._embedded?.contacts?.[0];
+      const contactId = mainContact?.id || null;
+
+      const sum2y = readNumericField(cust, CUSTOMER_FIELD_IDS.TWO_YEAR_SUM);
+      const count2y = readNumericField(cust, CUSTOMER_FIELD_IDS.TWO_YEAR_COUNT);
+      const totalPurchases = cust.purchases_count || 0;
+
+      if (count2y > 0 && sum2y > 0) {
+        active.push({ id: cust.id, contactId, ltv: sum2y, purchasesCount: count2y });
+      } else if (totalPurchases > 0) {
+        // Был покупателем когда-то, но не за последние 730 дней → Архив
+        archive.push({ customerId: cust.id, contactId });
       }
+      // count_2y=0 И total=0 → пустая запись (например очищенный дубль), пропускаем
     }
 
     if (!data._links?.next) break;
@@ -114,40 +136,37 @@ export async function fetchCustomersWithPurchases(): Promise<CustomerData[]> {
     await sleep(150);
   }
 
-  console.log(`  Fetched ${customers.length} customers with purchases`);
+  console.log(`  Active (in 2y window): ${active.length}, Archive (no 2y purchases): ${archive.length}`);
 
-  // Для каждого покупателя получаем дату последней транзакции
+  // Для активных получаем дату последней транзакции В ОКНЕ
+  const cutoff = cutoffTimestamp();
   const result: CustomerData[] = [];
-  const chunks = chunkArray(customers, CONCURRENT);
+  const chunks = chunkArray(active, CONCURRENT);
 
   for (const chunk of chunks) {
     const promises = chunk.map(async (cust) => {
       try {
-        // Загружаем ВСЕ транзакции чтобы найти реальную дату последней покупки
         let maxCompletedAt = 0;
+        let minCompletedAt = 0;
         let txPage = 1;
 
         while (true) {
           const url = `${BASE_URL}/api/v4/customers/${cust.id}/transactions?limit=250&page=${txPage}`;
           const res = await fetchWithRetry(url, { headers });
-
           if (!res.ok || res.status === 204) break;
-
           const data = await res.json();
           const txns = data?._embedded?.transactions || [];
-
           for (const tx of txns) {
-            if (tx.completed_at > maxCompletedAt) {
-              maxCompletedAt = tx.completed_at;
-            }
+            if (tx.completed_at < cutoff) continue;
+            if (tx.completed_at > maxCompletedAt) maxCompletedAt = tx.completed_at;
+            if (minCompletedAt === 0 || tx.completed_at < minCompletedAt) minCompletedAt = tx.completed_at;
           }
-
           if (!data._links?.next) break;
           txPage++;
           await sleep(150);
         }
 
-        if (maxCompletedAt === 0) return null;
+        if (maxCompletedAt === 0) return null; // несогласованность 2y-полей и транзакций
 
         return {
           customerId: cust.id,
@@ -155,6 +174,7 @@ export async function fetchCustomersWithPurchases(): Promise<CustomerData[]> {
           ltv: cust.ltv,
           purchasesCount: cust.purchasesCount,
           lastPurchaseAt: maxCompletedAt,
+          firstPurchaseAtIn2y: minCompletedAt,
         };
       } catch (err: any) {
         console.warn(`  Skip customer ${cust.id}: ${err.message}`);
@@ -163,14 +183,17 @@ export async function fetchCustomersWithPurchases(): Promise<CustomerData[]> {
     });
 
     const results = await Promise.all(promises);
-    for (const r of results) {
-      if (r) result.push(r);
-    }
-
+    for (const r of results) if (r) result.push(r);
     await sleep(300);
   }
 
-  return result;
+  return { active: result, archive };
+}
+
+// Совместимость со старыми вызовами
+export async function fetchCustomersWithPurchases(): Promise<CustomerData[]> {
+  const { active } = await fetchCustomersForRFM();
+  return active;
 }
 
 // ─── Покупатели: обновить сегменты ──────────────────────

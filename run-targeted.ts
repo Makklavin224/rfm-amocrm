@@ -62,14 +62,20 @@ async function main() {
     if (!main) { console.warn(`  ${cid}: no contact`); continue; }
     const contactId = main.id;
 
-    // 2. Дата последней транзакции
+    // 2. Даты первой и последней транзакции в окне 2 года
+    const cutoffSec = Math.floor((Date.now() - 730 * 86400 * 1000) / 1000);
     let lastAt = 0;
+    let firstAt = 0;
     let page = 1;
     while (true) {
       const tr = await fetch(`${BASE_URL}/api/v4/customers/${cid}/transactions?limit=250&page=${page}`, { headers });
       if (tr.status === 204 || !tr.ok) break;
       const d = await tr.json();
-      for (const t of d._embedded?.transactions || []) if (t.completed_at > lastAt) lastAt = t.completed_at;
+      for (const t of d._embedded?.transactions || []) {
+        if (t.completed_at < cutoffSec) continue;
+        if (t.completed_at > lastAt) lastAt = t.completed_at;
+        if (firstAt === 0 || t.completed_at < firstAt) firstAt = t.completed_at;
+      }
       if (!d._links?.next) break;
       page++;
       await sleep(200);
@@ -77,7 +83,7 @@ async function main() {
     if (!lastAt) { console.warn(`  ${cid}: no txns`); continue; }
 
     // 3. Сегмент
-    const { segment, daysSince, revPct, freqPct } = calculateSingleSegment(ltv, purchases, lastAt, thr.revenues, thr.frequencies);
+    const { segment, daysSince, revPct, freqPct } = calculateSingleSegment(ltv, purchases, lastAt, thr.revenues, thr.frequencies, firstAt);
     const segId = SEGMENT_IDS[segment];
     console.log(`  ${cid} (contact ${contactId}) ltv=${ltv} purchases=${purchases} days=${daysSince} → "${segment}"`);
 

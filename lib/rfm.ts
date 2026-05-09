@@ -48,6 +48,7 @@ export function calculateSegments(customers: CustomerData[]): CustomerSegment[] 
   const withDays = customers.map((c) => ({
     ...c,
     daysSince: Math.floor((now - c.lastPurchaseAt) / 86400),
+    daysSinceFirst: Math.floor((now - c.firstPurchaseAtIn2y) / 86400),
   }));
 
   const activeBase = withDays.filter((c) => c.daysSince <= 730);
@@ -66,7 +67,7 @@ export function calculateSegments(customers: CustomerData[]): CustomerSegment[] 
     const revPct = percentRank(revenues, c.ltv);
     const freqPct = percentRank(frequencies, c.purchasesCount);
 
-    const segment = assignSegment(c.daysSince, revPct, freqPct);
+    const segment = assignSegment(c.daysSince, revPct, freqPct, c.daysSinceFirst);
 
     return {
       customerId: c.customerId,
@@ -88,14 +89,16 @@ export function calculateSingleSegment(
   purchasesCount: number,
   lastPurchaseAt: number,
   revenues: number[],
-  frequencies: number[]
-): { segment: RfmSegment; daysSince: number; revPct: number; freqPct: number } {
+  frequencies: number[],
+  firstPurchaseAtIn2y: number = lastPurchaseAt
+): { segment: RfmSegment; daysSince: number; daysSinceFirst: number; revPct: number; freqPct: number } {
   const now = Date.now() / 1000;
   const daysSince = Math.floor((now - lastPurchaseAt) / 86400);
+  const daysSinceFirst = Math.floor((now - firstPurchaseAtIn2y) / 86400);
   const revPct = percentRank(revenues, ltv);
   const freqPct = percentRank(frequencies, purchasesCount);
-  const segment = assignSegment(daysSince, revPct, freqPct);
-  return { segment, daysSince, revPct, freqPct };
+  const segment = assignSegment(daysSince, revPct, freqPct, daysSinceFirst);
+  return { segment, daysSince, daysSinceFirst, revPct, freqPct };
 }
 
 // ─── Дерево решений (ТЗ 2026-04) ────────────────────────
@@ -124,7 +127,8 @@ export function calculateSingleSegment(
 function assignSegment(
   daysSince: number,
   revPercentile: number,
-  freqPercentile: number
+  freqPercentile: number,
+  daysSinceFirst: number = daysSince
 ): RfmSegment {
   if (daysSince > 730) return 'Архив';
 
@@ -143,8 +147,14 @@ function assignSegment(
     return freqPercentile >= 0.8 ? 'Лояльные' : 'Перспективные';
   }
 
-  // Нижняя половина по деньгам
-  return daysSince <= 60 ? 'Новичок' : 'В зоне риска';
+  // Нижняя половина по деньгам (revenue < P50)
+  // Новичок: ВСЕ покупки в окне 2 года находятся в последних 60 днях
+  //          (т.е. первая покупка в окне ≤ 60 дней назад).
+  // Перспективные: купил недавно, но был и раньше → реактивация.
+  // В зоне риска: давно не было, сумма мелкая.
+  if (daysSinceFirst <= 60) return 'Новичок';
+  if (daysSince <= 60) return 'Перспективные';
+  return 'В зоне риска';
 }
 
 // ─── Пороговые значения (для логов/отображения) ─────────
